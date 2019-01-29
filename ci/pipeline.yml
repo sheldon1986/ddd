@@ -1,0 +1,327 @@
+resources:
+
+  - name: developer
+    type: git
+    source:
+      uri: {{git-address}}
+      branch: developer
+      private_key: {{github-private-key}}
+    check_every: 10s # for demo
+
+  - name: repo-stg
+    type: git
+    source:
+      uri: {{git-address}}
+      branch: staging
+      private_key: {{github-private-key}}
+    check_every: 10s # for demo
+
+  - name: repo-master
+    type: git
+    source:
+      uri: {{git-address}}
+      branch: master
+      private_key: {{github-private-key}}
+    check_every: 10s # for demo
+
+  - name: cf-prod
+    type: cf
+    source:
+      api: {{cf-api}}
+      username: {{cf-username}}
+      password: {{cf-password}}
+      organization: {{cf-org-prod}}
+      space: {{cf-space-prod}}
+      skip_cert_check: true
+
+  - name: cf-staging
+    type: cf
+    source:
+      api: {{cf-api}}
+      username: {{cf-username}}
+      password: {{cf-password}}
+      organization: {{cf-org-stg}}
+      space: {{cf-space-staging}}
+      skip_cert_check: true
+
+  - name: cf-dev
+    type: cf
+    source:
+      api: {{cf-api}}
+      username: {{cf-username}}
+      password: {{cf-password}}
+      organization: {{cf-org-dev}}
+      space: {{cf-space-dev}}
+      skip_cert_check: true
+  - name: m2
+    type: docker-image
+    source:
+      repository: making/m2
+
+jobs:
+
+  - name: test-develop
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: developer
+          trigger: true
+        - get: m2
+      - task: unit
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: java
+              tag: 8-jdk-alpine
+          inputs:
+            - name: repo
+            - name: m2
+          run:
+            path: sh
+            args:
+              - repo/ci/tasks/unit.sh
+
+  - name: deploy-develop
+    serial: true
+    public: false
+    plan:
+      - aggregate:
+        - get: m2
+        - get: repo
+          resource: developer
+          passed: [ test-develop ]
+          trigger: true
+      - task: build
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: java
+              tag: 8-jdk-alpine
+          inputs:
+            - name: repo
+            - name: m2
+          outputs:
+            - name: output
+          run:
+            path: sh
+            args:
+              - repo/ci/tasks/build.sh
+          params:
+            _JAVA_OPTIONS: -Duser.timezone=Asia/Tokyo -Duser.language=ja -Duser.country=JP -Djava.security.egd=file:/dev/./urandom
+      - put: cf-dev
+        params:
+          manifest: repo/manifest-dev.yml
+          path: output/demo.jar
+          current_app_name: developer
+
+  - name: stg-merge
+    plan:
+      - aggregate:
+        - get: cf-dev
+          passed: [ deploy-develop ]
+          trigger: false
+        - get: developer
+
+  - name: merge-dev-to-staging
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: developer
+        - get: developer
+          passed: [ stg-merge ]
+          trigger: true
+      - task: merge-dev-to-stg
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: getourneau/alpine-bash-git
+          inputs:
+            - name: repo
+            - name: developer
+          outputs:
+            - name: out
+          run:
+            path: /bin/bash
+            args:
+            - repo/ci/tasks/developer.sh
+            - -exc
+            - |
+              git push origin staging --force
+        params:
+          GIT_EMAIL: {{git-email}}
+          GIT_NAME: {{git-name}}
+      - put: repo
+        resource: repo-stg
+        params:
+          repository: out
+
+  - name: test-stg
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-stg
+          passed: [ merge-dev-to-staging ]
+          trigger: true
+        - get: m2
+      - task: unit
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: java
+              tag: 8-jdk-alpine
+          inputs:
+            - name: repo
+            - name: m2
+          run:
+            path: sh
+            args:
+              - repo/ci/tasks/unit.sh
+
+  - name: deploy-staging
+    serial: true
+    public: false
+    plan:
+      - aggregate:
+        - get: m2
+        - get:  repo
+          resource: repo-stg
+          passed: [ test-stg ]
+          trigger: true
+      - task: build
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: java
+              tag: 8-jdk-alpine
+          inputs:
+            - name: repo
+            - name: m2
+          outputs:
+            - name: output
+          run:
+            path: sh
+            args:
+              - repo/ci/tasks/build.sh
+          params:
+            _JAVA_OPTIONS: -Duser.timezone=Asia/Tokyo -Duser.language=ja -Duser.country=JP -Djava.security.egd=file:/dev/./urandom
+      - put: cf-staging
+        params:
+          manifest: repo/manifest-staging.yml
+          path: output/demo.jar
+          current_app_name: concourse-ci-demo-stg
+
+  - name: pass-stg
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-stg
+        - get: cf-staging
+          passed: [ deploy-staging ]
+          trigger: false
+
+  - name: deploy-prod
+    serial: true
+    public: false
+    plan:
+      - aggregate:
+        - get: m2
+        - get:  repo
+          resource: repo-stg
+          passed: [ pass-stg ]
+          trigger: true
+      - task: build
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: java
+              tag: 8-jdk-alpine
+          inputs:
+            - name: repo
+            - name: m2
+          outputs:
+            - name: output
+          run:
+            path: sh
+            args:
+              - repo/ci/tasks/build.sh
+          params:
+            _JAVA_OPTIONS: -Duser.timezone=Asia/Tokyo -Duser.language=ja -Duser.country=JP -Djava.security.egd=file:/dev/./urandom
+      - put: cf-prod
+        params:
+          manifest: repo/manifest.yml
+          path: output/demo.jar
+          current_app_name: concourse-ci-demo-prod
+
+  - name: roll-back
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-stg
+        - get: cf-prod
+          passed: [ deploy-prod ]
+          trigger: false
+      - task: destroy-branch
+        file: repo/ci/tasks/rollback.sh
+
+  - name: close
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-stg
+        - get: cf-prod
+          passed: [ deploy-prod ]
+          trigger: false
+
+  - name: merge-stg-to-master
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-stg
+        - get: repo-stg
+          passed: [ close ]
+          trigger: true
+      - task: merge-stg-to-master
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: getourneau/alpine-bash-git
+          inputs:
+            - name: repo
+            - name: repo-stg
+          outputs:
+            - name: out
+          run:
+            path: /bin/bash
+            args:
+            - repo/ci/tasks/merge-release-branch.sh
+        params:
+          GIT_EMAIL: {{git-email}}
+          GIT_NAME: {{git-name}}
+      - put: repo
+        resource: repo-master
+        params:
+          repository: out
